@@ -78,8 +78,13 @@ const State = {
                 this.data.fleet[name] = { 
                     trips: [], 
                     plate: '', 
-                    color: CONFIG.colors[i % CONFIG.colors.length] 
+                    color: CONFIG.colors[i % CONFIG.colors.length],
+                    initialBoxes: 0 // Campo para estoque inicial
                 };
+            }
+            // Garante que o campo exista para motoristas antigos
+            if (this.data.fleet[name].initialBoxes === undefined) {
+                this.data.fleet[name].initialBoxes = 0;
             }
         });
         this.save();
@@ -102,6 +107,13 @@ const State = {
     
     getDriversByShift() {
         return this.session.shift === 'day' ? CONFIG.drivers.day : CONFIG.drivers.night;
+    },
+
+    updateInitialBoxes(name, qty) {
+        if (this.data.fleet[name]) {
+            this.data.fleet[name].initialBoxes = parseInt(qty) || 0;
+            this.save();
+        }
     },
 
     addTrip(driverName, tripData) {
@@ -156,7 +168,6 @@ const State = {
         }
     },
 
-    // --- LÓGICA DE ATERRO ---
     addDisposalPoint(name, address, coords) {
         this.data.disposalPoints.push({ id: Date.now(), name, address, coords });
         this.save();
@@ -338,12 +349,37 @@ const RouteOptimizer = {
         let currentPos = startCoords;
         let sorted = [];
 
+        // LÓGICA DE INVENTÁRIO DURANTE A OTIMIZAÇÃO
+        // Calculamos o saldo atual de caixas antes de começar a otimizar o restante
+        let runningInventory = driver.initialBoxes || 0;
+        fixedTrips.forEach(t => {
+            const q = parseInt(t.qty) || 0;
+            if (t.type === 'colocacao') runningInventory -= q;
+            else if (t.type === 'retirada') runningInventory += q;
+            // Troca e encher mantêm saldo líquido igual
+        });
+
         while(pool.length > 0) {
             let closestIndex = -1;
             let minDist = Infinity;
 
-            for(let i=0; i<pool.length; i++) {
+            // Determinar quais são os candidatos viáveis com base no estoque
+            let candidates = pool;
+            
+            // Se o motorista está sem caixas (ou saldo insuficiente), 
+            // priorizamos a RETIRADA mais próxima para "ter caixas" e poder continuar.
+            if (runningInventory <= 0) {
+                const availableRetiradas = pool.filter(p => p.type === 'retirada');
+                if (availableRetiradas.length > 0) {
+                    candidates = availableRetiradas;
+                }
+            }
+
+            // Busca pelo serviço mais próximo dentro dos candidatos permitidos
+            for(let i=0; i < pool.length; i++) {
                 const p = pool[i];
+                if (!candidates.includes(p)) continue; // Ignora se não for uma retirada necessária
+
                 const d = GeoService.getDistance(currentPos.lat, currentPos.lon, p.to.lat, p.to.lon);
                 if(d < minDist) {
                     minDist = d;
@@ -351,10 +387,28 @@ const RouteOptimizer = {
                 }
             }
 
+            // Se por algum motivo (ex: só tem colocação e não tem retirada no pool) não achou candidato,
+            // pega o mais próximo geral para não travar o algoritmo, mas a UI mostrará o erro.
+            if (closestIndex === -1 && pool.length > 0) {
+                for(let i=0; i < pool.length; i++) {
+                    const p = pool[i];
+                    const d = GeoService.getDistance(currentPos.lat, currentPos.lon, p.to.lat, p.to.lon);
+                    if(d < minDist) {
+                        minDist = d;
+                        closestIndex = i;
+                    }
+                }
+            }
+
             if(closestIndex !== -1) {
                 const nextTrip = pool[closestIndex];
                 nextTrip.from = currentPos;
                 
+                // Atualiza o inventário simulado para a escolha da PRÓXIMA parada
+                const q = parseInt(nextTrip.qty) || 0;
+                if (nextTrip.type === 'colocacao') runningInventory -= q;
+                else if (nextTrip.type === 'retirada') runningInventory += q;
+
                 await GeoService.delay(100); 
                 const routeObj = await GeoService.getRoutePolyline(currentPos, nextTrip.to);
                 
@@ -1299,7 +1353,6 @@ const App = {
         });
     },
 
-    // --- DRAG AND DROP HANDLERS ---
     handleDragStart(e, driverName, index) {
         this.dragSource = { driver: driverName, index: index };
         e.dataTransfer.effectAllowed = 'move';
@@ -1349,41 +1402,57 @@ const App = {
             const d = State.getDriver(name);
             if(!d.trips.length) return;
             
+            // LOGICA DE INVENTARIO PARA O MONITORAMENTO
+            let currentBalance = d.initialBoxes || 0;
+            const balanceSteps = [];
+
             const card = document.createElement('div');
             card.className = "bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm";
             
             let html = `
-                <div onclick="this.nextElementSibling.classList.toggle('hidden')" class="p-3 bg-slate-50/50 flex justify-between items-center cursor-pointer hover:bg-slate-100 transition border-b border-slate-100">
-                    <div class="flex items-center gap-3">
+                <div class="p-3 bg-slate-50/50 flex justify-between items-center border-b border-slate-100">
+                    <div class="flex items-center gap-3" onclick="this.parentElement.nextElementSibling.classList.toggle('hidden')">
                         <div class="w-8 h-8 rounded-lg text-white text-xs flex items-center justify-center font-bold shadow-sm" style="background:${d.color}">${name.substring(0,2)}</div>
                         <div>
                             <span class="font-bold text-xs text-slate-700 block">${name}</span>
                             ${d.plate ? '<span class="text-[9px] text-slate-400 font-mono tracking-tight">'+d.plate+'</span>' : ''}
                         </div>
                     </div>
-                    <span class="text-[10px] bg-white px-2 py-0.5 rounded-full border border-slate-200 font-bold text-slate-500">${d.trips.length}</span>
+                    <div class="flex flex-col items-end gap-1">
+                        <div class="flex items-center gap-2">
+                            <span class="text-[10px] font-bold text-slate-400 uppercase">Estoque Inicial:</span>
+                            <input type="number" class="input-inventory" value="${d.initialBoxes}" onchange="State.updateInitialBoxes('${name}', this.value); App.renderList()">
+                        </div>
+                    </div>
                 </div>
                 <div class="p-3 space-y-3">
             `;
 
             d.trips.forEach((t, i) => {
+                const qty = parseInt(t.qty) || 0;
+                let hasError = false;
+
+                // Lógica solicitada
+                if (t.type === 'colocacao') {
+                    if (currentBalance < qty) hasError = true;
+                    currentBalance -= qty;
+                } else if (t.type === 'retirada') {
+                    currentBalance += qty;
+                } else if (t.type === 'troca') {
+                    // Para trocar precisa ter uma vazia disponível
+                    if (currentBalance < qty) hasError = true;
+                    // Saldo não muda no final (tira uma vazia, põe uma cheia no caminhão)
+                }
+
+                const errorMsg = hasError ? `<div class="inventory-badge inventory-error mt-1"><i class="fas fa-exclamation-triangle"></i> SEM CAIXA! PRECISA RETIRAR</div>` : '';
+                const balanceDisplay = `<span class="text-[9px] font-bold ${currentBalance < 0 ? 'text-red-500' : 'text-slate-400'} uppercase ml-auto">Saldo: ${currentBalance}</span>`;
+
                 const descarteClass = t.descarteLocal ? 'active bg-red-50 border-red-200 text-red-500' : 'text-slate-300 hover:text-slate-500 border-transparent';
-                
-                const recalcBtn = (i < d.trips.length - 1) 
-                    ? `<button onclick="App.recalculateFrom('${name}', ${i})" class="ml-2 text-[9px] bg-blue-50 text-blue-600 border border-blue-200 px-2 py-0.5 rounded font-bold hover:bg-blue-100 transition flex items-center gap-1"><i class="fas fa-route"></i> Recalcular Próximas</button>`
-                    : '';
-
-                const descarteDisplay = t.descarteLocal 
-                    ? `<div class="mt-1.5 flex flex-wrap items-center gap-1">
-                          <div class="text-[9px] font-bold text-red-500 flex items-center gap-1.5 p-1 bg-red-50 rounded border border-red-100 w-fit"><i class="fas fa-trash-arrow-up"></i> DESCARTAR EM: ${t.descarteLocal}</div>
-                        </div>` 
-                    : '';
-
+                const recalcBtn = (i < d.trips.length - 1) ? `<button onclick="App.recalculateFrom('${name}', ${i})" class="ml-2 text-[9px] bg-blue-50 text-blue-600 border border-blue-200 px-2 py-0.5 rounded font-bold hover:bg-blue-100 transition flex items-center gap-1"><i class="fas fa-route"></i> Recalcular Próximas</button>` : '';
+                const descarteDisplay = t.descarteLocal ? `<div class="mt-1.5 flex flex-wrap items-center gap-1"><div class="text-[9px] font-bold text-red-500 flex items-center gap-1.5 p-1 bg-red-50 rounded border border-red-100 w-fit"><i class="fas fa-trash-arrow-up"></i> DESCARTAR EM: ${t.descarteLocal}</div></div>` : '';
                 const obsDisplay = t.obs ? `<div class="mt-1 text-[9px] text-amber-600 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-100 w-fit"><i class="fas fa-comment-dots text-[8px] mr-1"></i>${t.obs}</div>` : '';
                 const companyDisplay = t.empresa ? `<span class="text-[8px] font-bold text-blue-600 bg-blue-50 px-1 rounded mr-1">${t.empresa}</span>` : '';
-
                 const distDisplay = t.distance ? `<span class="text-[9px] text-slate-400 font-bold text-blue-600">(${t.distance} km)</span>` : '';
-                
                 const timeStr = WhatsappService.formatDuration(t.duration, t.distance);
                 const timeDisplay = timeStr ? `<span class="text-[9px] text-slate-400 font-bold text-green-600 ml-1"><i class="far fa-clock"></i>${timeStr.replace(' [~', ' ').replace(']', '')}</span>` : '';
                 
@@ -1402,23 +1471,22 @@ const App = {
                     <div class="flex justify-between items-start pl-2">
                         <div class="flex-1 min-w-0 pr-2">
                             <div class="flex flex-wrap gap-1 mb-0.5 items-center">
-                                <div class="mr-1.5 text-slate-300 hover:text-slate-500 cursor-grab active:cursor-grabbing" title="Arrastar para reordenar"><i class="fas fa-grip-vertical text-[10px]"></i></div>
-                                
+                                <div class="mr-1.5 text-slate-300 hover:text-slate-500 cursor-grab active:cursor-grabbing"><i class="fas fa-grip-vertical text-[10px]"></i></div>
                                 <div class="flex items-center gap-1 mr-1">
-                                     <button onclick="App.changeQty('${name}',${i})" class="text-[10px] font-black text-slate-800 hover:text-blue-600 border-b border-dotted border-slate-300 min-w-[1.2rem]" title="Mudar Qtd">${t.qty}</button>
-                                     <button onclick="App.cycleType('${name}',${i})" class="text-[10px] font-black text-slate-800 hover:text-blue-600 border-b border-dotted border-slate-300" title="Mudar Tipo">${displayType}</button>
+                                     <button onclick="App.changeQty('${name}',${i})" class="text-[10px] font-black text-slate-800 hover:text-blue-600 border-b border-dotted border-slate-300 min-w-[1.2rem]">${t.qty}</button>
+                                     <button onclick="App.cycleType('${name}',${i})" class="text-[10px] font-black text-slate-800 hover:text-blue-600 border-b border-dotted border-slate-300">${displayType}</button>
                                 </div>
                                 <span class="text-[10px] text-slate-500 truncate">- ${companyDisplay}${t.obra || ''}</span>
-                                <button onclick="App.editTripText('${name}',${i})" class="text-[10px] text-blue-400 hover:text-blue-600 ml-1" title="Editar Texto"><i class="fas fa-pen"></i></button>
                             </div>
                             <div class="text-[10px] text-slate-400 truncate">${WhatsappService.formatAddress(t.to.text)} ${distDisplay}${timeDisplay}</div>
                             ${obsDisplay}
                             ${descarteDisplay}
-                            <div class="mt-1">${recalcBtn}</div>
+                            ${errorMsg}
+                            <div class="mt-1 flex items-center">${recalcBtn} ${balanceDisplay}</div>
                         </div>
                         <div class="flex gap-1 shrink-0">
-                            <button onclick="App.editObs('${name}',${i})" class="btn-descarte w-7 h-7 border rounded flex items-center justify-center text-blue-400 hover:bg-blue-50 border-blue-100" title="Adicionar Observação"><i class="fas fa-cloud text-xs"></i></button>
-                            <button onclick="App.openDisposalModal(${i})" class="btn-descarte w-7 h-7 border rounded flex items-center justify-center ${descarteClass}" title="Definir Descarte"><i class="fas fa-recycle text-xs"></i></button>
+                            <button onclick="App.editObs('${name}',${i})" class="btn-descarte w-7 h-7 border rounded flex items-center justify-center text-blue-400 hover:bg-blue-50 border-blue-100" title="Observação"><i class="fas fa-cloud text-xs"></i></button>
+                            <button onclick="App.openDisposalModal(${i})" class="btn-descarte w-7 h-7 border rounded flex items-center justify-center ${descarteClass}" title="Descarte"><i class="fas fa-recycle text-xs"></i></button>
                             <button onclick="App.deleteTrip('${name}',${i})" class="w-7 h-7 rounded flex items-center justify-center text-slate-300 hover:text-red-500 hover:bg-red-50 transition"><i class="fas fa-times text-xs"></i></button>
                         </div>
                     </div>
@@ -1461,13 +1529,7 @@ const App = {
                      iconAnchor: [16, 16]
                  });
                  L.marker([t.disposalCoords.lat, t.disposalCoords.lon], { icon: disposalIcon }).addTo(UI.layerGroup);
-                 
-                 L.polyline([[t.to.lat, t.to.lon], [t.disposalCoords.lat, t.disposalCoords.lon]], {
-                     color: '#22c55e',
-                     dashArray: '5, 10',
-                     weight: 2,
-                     opacity: 0.7
-                 }).addTo(UI.map);
+                 L.polyline([[t.to.lat, t.to.lon], [t.disposalCoords.lat, t.disposalCoords.lon]], { color: '#22c55e', dashArray: '5, 10', weight: 2, opacity: 0.7 }).addTo(UI.map);
             }
         });
 
@@ -1498,13 +1560,10 @@ const App = {
     cycleType(name, index) {
         const d = State.getDriver(name);
         if(!d || !d.trips[index]) return;
-        
         const types = ['troca', 'colocacao', 'retirada', 'encher'];
         const current = d.trips[index].type;
-        
         let nextIndex = types.indexOf(current) + 1;
         if (nextIndex >= types.length || nextIndex === -1) nextIndex = 0;
-        
         State.updateTripType(name, index, types[nextIndex]);
         this.renderList();
         this.renderMiniHistory(name);
@@ -1513,20 +1572,15 @@ const App = {
     editTripText(name, index) {
         const d = State.getDriver(name);
         if(!d || !d.trips[index]) return;
-        
         const currentCompany = d.trips[index].empresa || '';
         const currentObra = d.trips[index].obra || '';
         const currentObs = d.trips[index].obs || ''; 
-        
         const newCompany = prompt("Editar Empresa:", currentCompany);
         if(newCompany === null) return; 
-        
         const newObra = prompt("Editar Obra:", currentObra);
         if(newObra === null) return; 
-
         const newObs = prompt("Editar Observação:", currentObs);
         if (newObs === null) return;
-
         State.updateTripText(name, index, newCompany, newObra, newObs);
         this.renderList();
     },
@@ -1545,10 +1599,8 @@ const App = {
     changeQty(name, index) {
         const d = State.getDriver(name);
         if(!d || !d.trips[index]) return;
-        
         const current = d.trips[index].qty;
         const newQty = prompt("Nova quantidade:", current);
-        
         if(newQty !== null) {
             State.updateTripQty(name, index, newQty);
             this.renderList();
@@ -1564,7 +1616,6 @@ const App = {
         const d = State.getDriver(name);
         const active = d.trips.filter(t => !t.completed);
         if (!active.length) return UI.toast("Sem rotas pendentes", "info");
-        
         let msg = WhatsappService.buildMessage(name, active, State.session.shift, d.plate);
         window.open(`https://wa.me/?text=${encodeURIComponent(msg)}`, '_blank');
     }
