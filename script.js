@@ -79,10 +79,9 @@ const State = {
                     trips: [], 
                     plate: '', 
                     color: CONFIG.colors[i % CONFIG.colors.length],
-                    initialBoxes: 0 // Campo para estoque inicial
+                    initialBoxes: 0 // Estoque inicial
                 };
             }
-            // Garante que o campo exista para motoristas antigos
             if (this.data.fleet[name].initialBoxes === undefined) {
                 this.data.fleet[name].initialBoxes = 0;
             }
@@ -349,36 +348,38 @@ const RouteOptimizer = {
         let currentPos = startCoords;
         let sorted = [];
 
-        // LÓGICA DE INVENTÁRIO DURANTE A OTIMIZAÇÃO
-        // Calculamos o saldo atual de caixas antes de começar a otimizar o restante
+        // --- INICIO DA LOGICA DE INTELIGÊNCIA DE INVENTÁRIO ---
+        // Calcula o estoque atual baseado no que já foi feito (viagens fixas)
         let runningInventory = driver.initialBoxes || 0;
         fixedTrips.forEach(t => {
             const q = parseInt(t.qty) || 0;
             if (t.type === 'colocacao') runningInventory -= q;
             else if (t.type === 'retirada') runningInventory += q;
-            // Troca e encher mantêm saldo líquido igual
         });
 
         while(pool.length > 0) {
             let closestIndex = -1;
             let minDist = Infinity;
 
-            // Determinar quais são os candidatos viáveis com base no estoque
-            let candidates = pool;
+            // Define os candidatos baseado na regra:
+            // 1. Se tem caixa (inv > 0), prefere Colocação ou Troca (Prioridade de Descarregar).
+            // 2. Se está sem caixa (inv <= 0), OBRIGA a ir para Retirada.
+            let candidates = [];
             
-            // Se o motorista está sem caixas (ou saldo insuficiente), 
-            // priorizamos a RETIRADA mais próxima para "ter caixas" e poder continuar.
-            if (runningInventory <= 0) {
-                const availableRetiradas = pool.filter(p => p.type === 'retirada');
-                if (availableRetiradas.length > 0) {
-                    candidates = availableRetiradas;
-                }
+            if (runningInventory > 0) {
+                candidates = pool.filter(p => p.type === 'colocacao' || p.type === 'troca' || p.type === 'encher');
+                // Se não tem nenhuma dessas sobrando no pool, pega o que sobrar
+                if (candidates.length === 0) candidates = pool;
+            } else {
+                candidates = pool.filter(p => p.type === 'retirada');
+                // Se não tem retirada sobrando no pool (erro de planejamento), pega o resto
+                if (candidates.length === 0) candidates = pool;
             }
 
-            // Busca pelo serviço mais próximo dentro dos candidatos permitidos
+            // Busca o mais próximo dentro dos candidatos permitidos pela lógica
             for(let i=0; i < pool.length; i++) {
                 const p = pool[i];
-                if (!candidates.includes(p)) continue; // Ignora se não for uma retirada necessária
+                if (!candidates.includes(p)) continue; 
 
                 const d = GeoService.getDistance(currentPos.lat, currentPos.lon, p.to.lat, p.to.lon);
                 if(d < minDist) {
@@ -387,29 +388,16 @@ const RouteOptimizer = {
                 }
             }
 
-            // Se por algum motivo (ex: só tem colocação e não tem retirada no pool) não achou candidato,
-            // pega o mais próximo geral para não travar o algoritmo, mas a UI mostrará o erro.
-            if (closestIndex === -1 && pool.length > 0) {
-                for(let i=0; i < pool.length; i++) {
-                    const p = pool[i];
-                    const d = GeoService.getDistance(currentPos.lat, currentPos.lon, p.to.lat, p.to.lon);
-                    if(d < minDist) {
-                        minDist = d;
-                        closestIndex = i;
-                    }
-                }
-            }
-
             if(closestIndex !== -1) {
                 const nextTrip = pool[closestIndex];
                 nextTrip.from = currentPos;
                 
-                // Atualiza o inventário simulado para a escolha da PRÓXIMA parada
+                // Atualiza o inventário simulado para a próxima iteração
                 const q = parseInt(nextTrip.qty) || 0;
                 if (nextTrip.type === 'colocacao') runningInventory -= q;
                 else if (nextTrip.type === 'retirada') runningInventory += q;
 
-                await GeoService.delay(100); 
+                await GeoService.delay(50); 
                 const routeObj = await GeoService.getRoutePolyline(currentPos, nextTrip.to);
                 
                 if(routeObj) {
@@ -419,13 +407,7 @@ const RouteOptimizer = {
                 nextTrip.distance = minDist.toFixed(1);
 
                 sorted.push(nextTrip);
-                
-                if (nextTrip.disposalCoords && nextTrip.disposalCoords.lat) {
-                    currentPos = nextTrip.disposalCoords;
-                } else {
-                    currentPos = nextTrip.to;
-                }
-                
+                currentPos = (nextTrip.disposalCoords && nextTrip.disposalCoords.lat) ? nextTrip.disposalCoords : nextTrip.to;
                 pool.splice(closestIndex, 1);
             } else {
                 sorted.push(pool.shift());
@@ -928,6 +910,24 @@ const App = {
         }
     },
 
+    // NOVO: Função para o mini botão de recálculo inteligente baseado em estoque
+    async reoptimizeByInventory(name) {
+        const driver = State.getDriver(name);
+        if(!driver || driver.trips.length === 0) return;
+        
+        UI.loading(true);
+        try {
+            // Recalcula a rota INTEIRA (index -1) a partir da Base Operacional
+            await RouteOptimizer.optimizeFrom(name, -1, CONFIG.geoBase);
+            UI.toast("Rota inteligente gerada!");
+        } catch(e) {
+            UI.toast("Erro no cálculo", "error");
+        } finally {
+            UI.loading(false);
+            this.renderList();
+        }
+    },
+
     clearTripDisposal() {
         const name = State.session.currentDriver;
         State.updateDescarte(name, UI.tempTripIndex, null, null);
@@ -1103,176 +1103,6 @@ const App = {
         }
     },
 
-    addToQueue() {
-        const empresa = document.getElementById('input-empresa').value;
-        const obra = document.getElementById('input-obra').value;
-        const dest = document.getElementById('input-dest').value;
-        
-        if (!dest) return UI.toast("Preencha o endereço", "error");
-
-        const item = {
-            empresa,
-            obra,
-            dest,
-            qty: document.getElementById('input-qty').value,
-            type: State.session.type,
-            obs: document.getElementById('input-obs').value
-        };
-
-        State.tempQueue.push(item);
-        
-        document.getElementById('input-dest').value = '';
-        document.getElementById('input-obs').value = '';
-        document.getElementById('input-empresa').focus(); 
-        
-        this.renderQueue();
-        UI.toast("Adicionado à fila!");
-    },
-
-    renderQueue() {
-        const container = document.getElementById('queue-container');
-        const list = document.getElementById('queue-list');
-        const count = document.getElementById('queue-count');
-        
-        list.innerHTML = '';
-        count.innerText = State.tempQueue.length;
-
-        if (State.tempQueue.length > 0) {
-            container.classList.remove('hidden');
-            State.tempQueue.forEach((item, index) => {
-                const div = document.createElement('div');
-                div.className = "flex justify-between items-center text-[10px] bg-white p-1 rounded border border-blue-100";
-                div.innerHTML = `<span class="truncate font-bold text-blue-800">${index+1}. ${item.empresa || 'Empresa'} - ${item.dest}</span>`;
-                list.appendChild(div);
-            });
-        } else {
-            container.classList.add('hidden');
-        }
-    },
-
-    async processQueue() {
-        const name = State.session.currentDriver;
-        if (!name || State.tempQueue.length === 0) return;
-
-        UI.loading(true);
-        
-        for (const item of State.tempQueue) {
-            try {
-                await this.addRouteFromData(name, item);
-            } catch (e) {
-                console.error(e);
-            }
-        }
-
-        State.tempQueue = [];
-        this.renderQueue();
-        UI.loading(false);
-        UI.toast("Fila processada com sucesso!");
-    },
-
-    async addRouteFromData(name, data) {
-        const raw = data.dest;
-        const extraInfoMatch = raw.match(/\((.*?)\)/);
-        const extraInfo = extraInfoMatch ? extraInfoMatch[1] : null;
-        const cleanRaw = raw.replace(/\(.*?\)/g, '').trim();
-
-        const location = await GeoService.resolveLocation(cleanRaw || raw);
-        
-        if (location) {
-            if (extraInfo) location.text += ` (${extraInfo})`;
-
-            const driver = State.getDriver(name);
-            let fromLocation = CONFIG.geoBase;
-            if(driver.trips.length > 0) {
-                const lastTrip = driver.trips[driver.trips.length - 1];
-                if(lastTrip.disposalCoords) {
-                    fromLocation = lastTrip.disposalCoords;
-                } else {
-                    fromLocation = lastTrip.to;
-                }
-            }
-
-            const inputs = {
-                empresa: data.empresa,
-                obra: data.obra,
-                qty: data.qty,
-                type: data.type,
-                obs: data.obs,
-                to: location,
-                from: fromLocation,
-                descarteLocal: null,
-                disposalCoords: null, 
-                completed: false
-            };
-
-            const routeObj = await GeoService.getRoutePolyline(inputs.from, inputs.to);
-            if (routeObj) {
-                inputs.geometry = routeObj.geometry;
-                inputs.duration = routeObj.duration;
-            }
-
-            State.addTrip(name, inputs);
-            
-            if (inputs.obra || inputs.empresa) {
-                const addressToSave = (location.isLink) ? raw : location.text;
-                State.addToAddressBook(inputs.empresa, inputs.obra, addressToSave);
-            }
-            
-            App.renderList();   
-            App.renderGrid();   
-            App.renderAddressBook();
-        }
-    },
-
-    addToAddressBook(company, name, address) {
-        let c = company, n = name, a = address;
-        let isManual = false;
-        
-        if (arguments.length === 0) {
-            isManual = true;
-            c = document.getElementById('db-company').value;
-            n = document.getElementById('db-name').value;
-            a = document.getElementById('db-addr').value;
-        }
-
-        const saved = State.addToAddressBook(c, n, a);
-        
-        if (saved) {
-            this.renderAddressBook();
-            if(isManual) {
-                document.getElementById('db-company').value = '';
-                document.getElementById('db-name').value = '';
-                document.getElementById('db-addr').value = '';
-                UI.toast("Salvo com sucesso!");
-            }
-            return true;
-        } else {
-            if(isManual) UI.toast("Já existe no banco", "info");
-            return false;
-        }
-    },
-    
-    removeFromAddressBook(id) {
-        this.data.addressBook = this.data.addressBook.filter(item => item.id !== id);
-        this.save();
-    },
-
-    searchAddressBook(query) {
-        if (!query) return [];
-        const q = query.toLowerCase();
-        return this.data.addressBook.filter(item => 
-            (item.name && item.name.toLowerCase().includes(q)) || 
-            (item.company && item.company.toLowerCase().includes(q))
-        ).slice(0, 5);
-    },
-
-    deleteFromAddressBook(id) {
-        if(confirm("Remover este endereço?")) {
-            State.removeFromAddressBook(id);
-            this.renderAddressBook();
-        }
-    },
-
     renderAddressBook() {
         const el = document.getElementById('db-list');
         el.innerHTML = '';
@@ -1404,7 +1234,6 @@ const App = {
             
             // LOGICA DE INVENTARIO PARA O MONITORAMENTO
             let currentBalance = d.initialBoxes || 0;
-            const balanceSteps = [];
 
             const card = document.createElement('div');
             card.className = "bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm";
@@ -1421,7 +1250,10 @@ const App = {
                     <div class="flex flex-col items-end gap-1">
                         <div class="flex items-center gap-2">
                             <span class="text-[10px] font-bold text-slate-400 uppercase">Estoque Inicial:</span>
-                            <input type="number" class="input-inventory" value="${d.initialBoxes}" onchange="State.updateInitialBoxes('${name}', this.value); App.renderList()">
+                            <div class="flex items-center gap-1">
+                                <input type="number" class="input-inventory" value="${d.initialBoxes}" onchange="State.updateInitialBoxes('${name}', this.value); App.renderList()">
+                                <button onclick="App.reoptimizeByInventory('${name}')" class="w-6 h-6 bg-blue-50 text-blue-600 rounded-full hover:bg-blue-600 hover:text-white transition flex items-center justify-center shadow-sm" title="Recalcular Rota Inteligente">🪄</button>
+                            </div>
                         </div>
                     </div>
                 </div>
@@ -1432,32 +1264,22 @@ const App = {
                 const qty = parseInt(t.qty) || 0;
                 let hasError = false;
 
-                // Lógica solicitada
+                // Lógica de cálculo de saldo passo-a-passo
                 if (t.type === 'colocacao') {
                     if (currentBalance < qty) hasError = true;
                     currentBalance -= qty;
                 } else if (t.type === 'retirada') {
                     currentBalance += qty;
-                } else if (t.type === 'troca') {
-                    // Para trocar precisa ter uma vazia disponível
+                } else if (t.type === 'troca' || t.type === 'encher') {
+                    // Troca exige que o caminhão tenha pelo menos uma caixa vazia para entregar
                     if (currentBalance < qty) hasError = true;
-                    // Saldo não muda no final (tira uma vazia, põe uma cheia no caminhão)
                 }
 
                 const errorMsg = hasError ? `<div class="inventory-badge inventory-error mt-1"><i class="fas fa-exclamation-triangle"></i> SEM CAIXA! PRECISA RETIRAR</div>` : '';
-                const balanceDisplay = `<span class="text-[9px] font-bold ${currentBalance < 0 ? 'text-red-500' : 'text-slate-400'} uppercase ml-auto">Saldo: ${currentBalance}</span>`;
+                const balanceDisplay = `<span class="text-[9px] font-bold ${currentBalance < 0 ? 'text-red-500' : 'text-slate-400'} uppercase ml-auto">Saldo Final: ${currentBalance}</span>`;
 
                 const descarteClass = t.descarteLocal ? 'active bg-red-50 border-red-200 text-red-500' : 'text-slate-300 hover:text-slate-500 border-transparent';
                 const recalcBtn = (i < d.trips.length - 1) ? `<button onclick="App.recalculateFrom('${name}', ${i})" class="ml-2 text-[9px] bg-blue-50 text-blue-600 border border-blue-200 px-2 py-0.5 rounded font-bold hover:bg-blue-100 transition flex items-center gap-1"><i class="fas fa-route"></i> Recalcular Próximas</button>` : '';
-                const descarteDisplay = t.descarteLocal ? `<div class="mt-1.5 flex flex-wrap items-center gap-1"><div class="text-[9px] font-bold text-red-500 flex items-center gap-1.5 p-1 bg-red-50 rounded border border-red-100 w-fit"><i class="fas fa-trash-arrow-up"></i> DESCARTAR EM: ${t.descarteLocal}</div></div>` : '';
-                const obsDisplay = t.obs ? `<div class="mt-1 text-[9px] text-amber-600 bg-amber-50 px-1.5 py-0.5 rounded border border-amber-100 w-fit"><i class="fas fa-comment-dots text-[8px] mr-1"></i>${t.obs}</div>` : '';
-                const companyDisplay = t.empresa ? `<span class="text-[8px] font-bold text-blue-600 bg-blue-50 px-1 rounded mr-1">${t.empresa}</span>` : '';
-                const distDisplay = t.distance ? `<span class="text-[9px] text-slate-400 font-bold text-blue-600">(${t.distance} km)</span>` : '';
-                const timeStr = WhatsappService.formatDuration(t.duration, t.distance);
-                const timeDisplay = timeStr ? `<span class="text-[9px] text-slate-400 font-bold text-green-600 ml-1"><i class="far fa-clock"></i>${timeStr.replace(' [~', ' ').replace(']', '')}</span>` : '';
-                
-                let displayType = t.type.toUpperCase();
-                if(t.type === 'encher') displayType = 'ENCHER NA HORA';
 
                 html += `
                 <div class="timeline-item ${t.completed ? 'opacity-50 grayscale' : ''}"
@@ -1471,23 +1293,22 @@ const App = {
                     <div class="flex justify-between items-start pl-2">
                         <div class="flex-1 min-w-0 pr-2">
                             <div class="flex flex-wrap gap-1 mb-0.5 items-center">
-                                <div class="mr-1.5 text-slate-300 hover:text-slate-500 cursor-grab active:cursor-grabbing"><i class="fas fa-grip-vertical text-[10px]"></i></div>
+                                <div class="mr-1.5 text-slate-300"><i class="fas fa-grip-vertical text-[10px]"></i></div>
                                 <div class="flex items-center gap-1 mr-1">
-                                     <button onclick="App.changeQty('${name}',${i})" class="text-[10px] font-black text-slate-800 hover:text-blue-600 border-b border-dotted border-slate-300 min-w-[1.2rem]">${t.qty}</button>
-                                     <button onclick="App.cycleType('${name}',${i})" class="text-[10px] font-black text-slate-800 hover:text-blue-600 border-b border-dotted border-slate-300">${displayType}</button>
+                                     <button onclick="App.changeQty('${name}',${i})" class="text-[10px] font-black text-slate-800 border-b border-dotted border-slate-300 min-w-[1.2rem]">${t.qty}</button>
+                                     <button onclick="App.cycleType('${name}',${i})" class="text-[10px] font-black text-slate-800 border-b border-dotted border-slate-300">${t.type.toUpperCase()}</button>
                                 </div>
-                                <span class="text-[10px] text-slate-500 truncate">- ${companyDisplay}${t.obra || ''}</span>
+                                <span class="text-[10px] text-slate-500 truncate">- ${t.empresa || ''} ${t.obra || ''}</span>
                             </div>
-                            <div class="text-[10px] text-slate-400 truncate">${WhatsappService.formatAddress(t.to.text)} ${distDisplay}${timeDisplay}</div>
-                            ${obsDisplay}
-                            ${descarteDisplay}
+                            <div class="text-[10px] text-slate-400 truncate">${WhatsappService.formatAddress(t.to.text)} <span class="text-blue-600 font-bold">(${t.distance} km)</span></div>
+                            ${t.obs ? `<div class="mt-1 text-[9px] text-amber-600 bg-amber-50 px-1 rounded italic w-fit">Obs: ${t.obs}</div>` : ''}
+                            ${t.descarteLocal ? `<div class="mt-1.5 flex items-center gap-1"><div class="text-[9px] font-bold text-red-500 flex items-center gap-1.5 p-1 bg-red-50 rounded border border-red-100 w-fit"><i class="fas fa-trash-arrow-up"></i> DESCARTAR EM: ${t.descarteLocal}</div></div>` : ''}
                             ${errorMsg}
                             <div class="mt-1 flex items-center">${recalcBtn} ${balanceDisplay}</div>
                         </div>
                         <div class="flex gap-1 shrink-0">
-                            <button onclick="App.editObs('${name}',${i})" class="btn-descarte w-7 h-7 border rounded flex items-center justify-center text-blue-400 hover:bg-blue-50 border-blue-100" title="Observação"><i class="fas fa-cloud text-xs"></i></button>
-                            <button onclick="App.openDisposalModal(${i})" class="btn-descarte w-7 h-7 border rounded flex items-center justify-center ${descarteClass}" title="Descarte"><i class="fas fa-recycle text-xs"></i></button>
-                            <button onclick="App.deleteTrip('${name}',${i})" class="w-7 h-7 rounded flex items-center justify-center text-slate-300 hover:text-red-500 hover:bg-red-50 transition"><i class="fas fa-times text-xs"></i></button>
+                            <button onclick="App.openDisposalModal(${i})" class="btn-descarte w-7 h-7 border rounded flex items-center justify-center ${descarteClass}"><i class="fas fa-recycle text-xs"></i></button>
+                            <button onclick="App.deleteTrip('${name}',${i})" class="w-7 h-7 rounded flex items-center justify-center text-slate-300 hover:text-red-500 transition"><i class="fas fa-times text-xs"></i></button>
                         </div>
                     </div>
                 </div>`;
