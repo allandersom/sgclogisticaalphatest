@@ -116,6 +116,50 @@ body.night-mode #section-planning .bg-slate-100 {
     transform: none !important;
 }
 
+/* --- INVENTÁRIO LOGIC STYLES --- */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+
+.timeline-item.bg-red-50\/50 {
+    border-left: 4px solid #ef4444;
+}
+
+.inventory-badge {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.25rem 0.75rem;
+    border-radius: 9999px;
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+
+.inventory-error {
+    background-color: #fee2e2;
+    color: #ef4444;
+    border: 1px solid #fecaca;
+    animation: pulse-red 2s infinite;
+}
+
+@keyframes pulse-red {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.7; }
+}
+
+.input-inventory {
+    width: 3rem;
+    text-align: center;
+    background: transparent;
+    border-bottom: 2px solid var(--accent);
+    color: var(--accent);
+    font-weight: 800;
+    outline: none;
+}
+
 /* ---------------------------------- */
 
 .custom-scroll::-webkit-scrollbar { width: 4px; }
